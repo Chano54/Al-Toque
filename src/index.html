@@ -238,10 +238,12 @@
    entre pestañas del mismo celular o compu. El pago es simulado.
    ===================================================================== */
 
-const STORE_KEY = 'altoque-demo-v2';
-const MINE_KEY  = 'altoque-mis-pedidos-v2';
+const STORE_KEY = 'altoque-demo-v3';
+const MINE_KEY  = 'altoque-mis-pedidos-v3';
+const CARD_KEY  = 'altoque-tarjeta-v3';
 const LOCAL = { nombre: 'Discoteca Demo', barra: 'Barra principal' };
-const COMISION = 1;       // S/ por pedido que paga el cliente (modelo de ejemplo)
+const POR_TRAGO = 1;      // S/ de servicio Al Toque por cada trago (lo paga el cliente)
+const NO_RECOGIDO_MIN = 30; // si un pedido con tarjeta no se recoge en este tiempo, se cobra igual
 const SAT_AVISO = 85;     // % desde el que el cliente ve aviso de espera
 
 const MENU_INICIAL = [
@@ -292,7 +294,19 @@ const sumItems = items => items.reduce((a, l) => a + l.qty * l.price, 0);
 const countItems = items => items.reduce((a, l) => a + l.qty, 0);
 const findOrder = id => state.orders.find(o => o.id === id);
 const isActive = o => o.status === 'nuevo' || o.status === 'preparando';
-const isCharged = o => o.status === 'preparando' || o.status === 'listo' || o.status === 'entregado';
+const isMade = o => o.status === 'preparando' || o.status === 'listo' || o.status === 'entregado';
+const feeFor = lines => countItems(lines) * POR_TRAGO;
+const grand = o => o.total + o.fee;
+const PAGO_TXT = { yape:'Yape', tarjeta:'Tarjeta' };
+function payLabel(o){
+  return { cobrado:'Cobrado', separado:'Separado en tarjeta', devuelto:'Devuelto', liberado:'Liberado · sin cobro' }[o.payState];
+}
+/* Tarjeta guardada (en la demo solo se guarda la marca y los 4 últimos números, nunca el número completo) */
+function getCard(){ try { return JSON.parse(localStorage.getItem(CARD_KEY)); } catch(e){ return null; } }
+function saveCard(c){ try { localStorage.setItem(CARD_KEY, JSON.stringify(c)); } catch(e){} }
+function forgetCard(){ try { localStorage.removeItem(CARD_KEY); } catch(e){} }
+function cardBrand(num){ return /^4/.test(num) ? 'Visa' : /^(5[1-5]|2[2-7])/.test(num) ? 'Mastercard' : /^3[47]/.test(num) ? 'Amex' : 'Tarjeta'; }
+function luhn(num){ let s = 0, alt = false; for (let i = num.length - 1; i >= 0; i--) { let n = +num[i]; if (alt) { n *= 2; if (n > 9) n -= 9; } s += n; alt = !alt; } return s % 10 === 0; }
 function ago(t){ const m = Math.floor((Date.now() - t) / 60000); return m < 1 ? 'recién' : 'hace ' + m + ' min'; }
 function newCode(){
   const abc = 'ACEFHJKMNPRTUVWXY3479';
@@ -349,6 +363,7 @@ const buzz = p => { try { navigator.vibrate && navigator.vibrate(p); } catch(e){
 
 /* ---------------- Estado de pantallas ---------------- */
 const cli = { screen:'carta', cat:'Todos', cart:{}, name:'', pay:'yape', paying:false,
+              yapeCel:'', yapeCode:'', cardNum:'', cardExp:'', cardCvv:'', cardSave:true, newCard:false, payErr:'',
               alert:null, alertAnim:false, delivered:null, notice:null };
 let demoTab = 'cliente';
 let resetArmed = false;
@@ -360,12 +375,14 @@ state.orders.forEach(o => seen[o.id] = o.status);
 function route(){ return (location.hash.slice(1) || 'inicio').toLowerCase(); }
 
 /* ---------------- Acciones ---------------- */
-function createOrder({name, lines, pay, mine}){
+function createOrder({name, lines, pay, card, mine}){
   const o = {
     id: 'o' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
     num: state.nextNum++, code: newCode(),
-    name: name || 'Cliente', pay, lines,
-    total: sumItems(lines), status: 'nuevo',
+    name: name || 'Cliente', pay, card: card || null, lines,
+    total: sumItems(lines), fee: feeFor(lines), status: 'nuevo',
+    // Yape se cobra al pedir. La tarjeta solo se separa: se cobra cuando escanean el QR al entregar.
+    payState: pay === 'tarjeta' ? 'separado' : 'cobrado',
     t: { created: Date.now() }
   };
   state.orders.push(o);
@@ -384,14 +401,29 @@ function fakeOrder(){
     const ex = lines.find(l => l.id === m.id);
     if (ex) ex.qty++; else lines.push({id:m.id, name:m.name, price:m.price, qty:1 + (Math.random() < .25 ? 1 : 0)});
   }
-  createOrder({ name: NOMBRES[Math.floor(Math.random() * NOMBRES.length)], lines, pay: ['yape','plin','tarjeta'][Math.floor(Math.random()*3)], mine:false });
+  const pay = Math.random() < .55 ? 'yape' : 'tarjeta';
+  createOrder({ name: NOMBRES[Math.floor(Math.random() * NOMBRES.length)], lines, pay,
+                card: pay === 'tarjeta' ? {brand:'Visa', last4: String(1000 + Math.floor(Math.random() * 9000))} : null, mine:false });
 }
 function setStatus(id, status){
   const o = findOrder(id); if (!o) return;
   o.status = status;
   const key = {preparando:'started', listo:'ready', entregado:'delivered', cancelado:'ended', rechazado:'ended'}[status];
   if (key) o.t[key] = Date.now();
+  // Movimientos de plata según el estado
+  if (status === 'entregado' && o.payState === 'separado') { o.payState = 'cobrado'; o.t.charged = Date.now(); }
+  if (status === 'cancelado' || status === 'rechazado') o.payState = o.payState === 'separado' ? 'liberado' : 'devuelto';
   commit();
+}
+/* Tarjeta separada y pedido listo pero nadie lo recoge: pasado el tiempo límite se cobra igual (el trago ya se preparó) */
+function chargeUncollected(){
+  let changed = false;
+  state.orders.forEach(o => {
+    if (o.status === 'listo' && o.payState === 'separado' && Date.now() - o.t.ready > NO_RECOGIDO_MIN * 60000) {
+      o.payState = 'cobrado'; o.t.charged = Date.now(); changed = true;
+    }
+  });
+  if (changed) commit();
 }
 
 const actions = {
@@ -401,17 +433,32 @@ const actions = {
   add: d => { const m = item(d.id); if (!m || !m.available) return; cli.cart[d.id] = (cli.cart[d.id] || 0) + 1; buzz(10); render(); },
   sub: d => { if (!cli.cart[d.id]) return; cli.cart[d.id]--; if (!cli.cart[d.id]) delete cli.cart[d.id]; render(); },
   screen: d => { cli.screen = d.s; render(); scrollViewTop(); },
-  pay: d => { cli.pay = d.p; render(); },
+  pay: d => { cli.pay = d.p; cli.payErr = ''; render(); },
   checkout: () => {
     const lines = cartLines(); if (!lines.length || cli.paying || state.settings.paused) return;
+    const err = validatePay(); cli.payErr = err; if (err) { render(); return; }
+    let card = null;
+    if (cli.pay === 'tarjeta') {
+      const saved = getCard();
+      if (saved && !cli.newCard) card = saved;
+      else {
+        const num = cli.cardNum.replace(/\D/g, '');
+        card = { brand: cardBrand(num), last4: num.slice(-4) };
+        if (cli.cardSave) saveCard(card);
+      }
+    }
     cli.paying = true; render();
     setTimeout(() => {
       if (state.settings.paused) { cli.paying = false; render(); return; }
-      createOrder({ name: cli.name.trim(), lines, pay: cli.pay, mine: true });
+      createOrder({ name: cli.name.trim(), lines, pay: cli.pay, card, mine: true });
       cli.cart = {}; cli.paying = false; cli.screen = 'pedidos';
+      cli.yapeCode = ''; cli.cardNum = ''; cli.cardExp = ''; cli.cardCvv = ''; cli.newCard = false;
       render(); scrollViewTop();
-    }, 1400);
+    }, 1600);
   },
+  toggleSave: () => { cli.cardSave = !cli.cardSave; render(); },
+  newCard: () => { cli.newCard = true; cli.payErr = ''; render(); },
+  forgetCard: () => { forgetCard(); cli.newCard = false; render(); },
   cancelOrder: d => { const o = findOrder(d.id); if (o && o.status === 'nuevo') setStatus(d.id, 'cancelado'); },
   showQr: d => { cli.alert = d.id; cli.alertAnim = true; render(); },
   closeAlert: () => { cli.alert = null; render(); },
@@ -453,7 +500,35 @@ document.addEventListener('click', e => {
   const fn = actions[el.dataset.act];
   if (fn) fn(el.dataset);
 });
-document.addEventListener('input', e => { if (e.target.dataset.key === 'name') cli.name = e.target.value; });
+document.addEventListener('input', e => {
+  const k = e.target.dataset.key; if (!k) return;
+  let v = e.target.value;
+  // Formato mientras escribe
+  if (k === 'yapeCel') v = v.replace(/\D/g, '').slice(0, 9);
+  if (k === 'yapeCode') v = v.replace(/\D/g, '').slice(0, 6);
+  if (k === 'cardNum') v = v.replace(/\D/g, '').slice(0, 16).replace(/(\d{4})(?=\d)/g, '$1 ');
+  if (k === 'cardExp') { v = v.replace(/\D/g, '').slice(0, 4); if (v.length > 2) v = v.slice(0, 2) + '/' + v.slice(2); }
+  if (k === 'cardCvv') v = v.replace(/\D/g, '').slice(0, 4);
+  if (v !== e.target.value) e.target.value = v;
+  if (k in cli) cli[k] = v;
+  if (cli.payErr) { cli.payErr = ''; const n = document.querySelector('.payerr'); if (n) n.remove(); }
+});
+function validatePay(){
+  if (cli.pay === 'yape') {
+    if (!/^9\d{8}$/.test(cli.yapeCel)) return 'Escribe tu número de Yape: 9 dígitos y empieza con 9.';
+    if (!/^\d{6}$/.test(cli.yapeCode)) return 'Falta el código de aprobación de 6 números (está en tu app de Yape).';
+    return '';
+  }
+  if (getCard() && !cli.newCard) return '';
+  const num = cli.cardNum.replace(/\D/g, '');
+  if (num.length < 15 || !luhn(num)) return 'Revisa el número de tu tarjeta.';
+  const m = /^(\d{2})\/(\d{2})$/.exec(cli.cardExp);
+  if (!m || +m[1] < 1 || +m[1] > 12) return 'Revisa la fecha de vencimiento (MM/AA).';
+  const exp = new Date(2000 + +m[2], +m[1], 1);
+  if (exp <= new Date()) return 'Esa tarjeta ya venció.';
+  if (!/^\d{3,4}$/.test(cli.cardCvv)) return 'Falta el código de seguridad (CVV), los 3 números de atrás.';
+  return '';
+}
 document.addEventListener('keydown', e => { if (e.key === 'Enter' && e.target.id === 'scan-code') actions.manualCode(); });
 window.addEventListener('hashchange', () => { hideToast(); closeScanner(); render(); window.scrollTo(0, 0); });
 
@@ -475,7 +550,7 @@ function onState(){
     seen[o.id] = o.status;
     if (!mine.has(o.id) || before === o.status || !clientVisible) return;
     if (o.status === 'preparando') {
-      notice('🍸 ¡Ya están preparando tu pedido #' + o.num + '! Se cobró ' + money(o.total) + '.');
+      notice('🍸 ¡Ya están preparando tu pedido #' + o.num + '! Desde ahora ya no se puede cancelar.');
       soundSoft(); buzz(80);
     } else if (o.status === 'listo') {
       cli.alert = o.id; cli.alertAnim = true; cli.delivered = null;
@@ -489,7 +564,7 @@ function onState(){
       deliveredTimer = setTimeout(() => { cli.delivered = null; render(); }, 4000);
       buzz(60);
     } else if (o.status === 'rechazado') {
-      notice('😕 La barra no pudo preparar tu pedido #' + o.num + '. No se te cobró nada.');
+      notice('😕 La barra no pudo preparar tu pedido #' + o.num + '. ' + (o.payState === 'liberado' ? 'Se liberó lo separado en tu tarjeta: no se te cobró nada.' : 'Te devolvemos ' + money(grand(o)) + ' a tu Yape.'));
       soundBad(); buzz([100, 80, 100]);
     }
   });
@@ -567,12 +642,14 @@ function handleScanned(text){
   if (!m) html = '<div class="t">Ese QR no es de Al Toque</div>';
   else if (!o || o.code !== m[2]) html = '<div class="t">Código no encontrado</div><div>Revisa que sea un pedido de esta noche.</div>';
   else if (o.status === 'entregado') html = `<div class="t">⚠️ Este QR ya se usó</div><div>El pedido #${o.num} se entregó ${ago(o.t.delivered)}. No entregues de nuevo.</div>`;
-  else if (o.status === 'cancelado' || o.status === 'rechazado') html = `<div class="t">Pedido #${o.num} anulado</div><div>No se cobró, no hay nada que entregar.</div>`;
+  else if (o.status === 'cancelado' || o.status === 'rechazado') html = `<div class="t">Pedido #${o.num} anulado</div><div>No hay nada que entregar.</div>`;
   else if (o.status !== 'listo') html = `<div class="t">#${o.num} todavía no está listo</div><div>Está ${o.status === 'nuevo' ? 'en cola' : 'en preparación'}.</div>`;
   else {
     good = true;
-    html = `<div class="t">✓ Entrega a ${esc(o.name)} · #${o.num}</div><ul>${o.lines.map(l => `<li>${esc(lineText(l))}</li>`).join('')}</ul>`;
+    const wasHeld = o.payState === 'separado';
     setStatus(o.id, 'entregado');
+    html = `<div class="t">✓ Entrega a ${esc(o.name)} · #${o.num}</div><ul>${o.lines.map(l => `<li>${esc(lineText(l))}</li>`).join('')}</ul>
+      <div style="margin-top:8px;font-weight:700">${wasHeld ? '💳 Cobrado ahora a la tarjeta' : '💜 Ya estaba pagado con Yape'}</div>`;
   }
   const res = document.getElementById('scan-res');
   res.innerHTML = html; res.className = 'on ' + (good ? 'good' : 'bad');
@@ -605,7 +682,7 @@ function viewInicio(){
     </div>
     <div class="steps">
       <div class="step"><div class="n">1</div><div><b>Escanea el QR del local</b><div class="muted small">Sin descargar nada. Se abre en el navegador.</div></div></div>
-      <div class="step"><div class="n">2</div><div><b>Pide y paga con Yape, Plin o tarjeta</b><div class="muted small">Solo se cobra cuando la barra empieza a prepararlo.</div></div></div>
+      <div class="step"><div class="n">2</div><div><b>Pide y paga con Yape o tarjeta</b><div class="muted small">Con tarjeta se cobra recién cuando recoges tu trago. Si no te lo preparan, te devolvemos todo.</div></div></div>
       <div class="step"><div class="n">3</div><div><b>Tu celular vibra y te muestra tu QR</b><div class="muted small">Sigues bailando hasta que esté listo.</div></div></div>
       <div class="step"><div class="n">4</div><div><b>Lo escanean en la barra y te vas</b><div class="muted small">Sin cola, sin hablar, sin cobrar en la barra.</div></div></div>
     </div>
@@ -629,7 +706,7 @@ function viewCliente(){
   let body;
   if (cli.paying) {
     body = `<div class="vbody" style="display:grid;place-items:center;text-align:center;padding-top:80px">
-      <div><div class="spinner"></div><b style="font-size:20px">Reservando tu pago…</b><p class="muted small" style="margin-top:6px">${({yape:'Yape', plin:'Plin', tarjeta:'Tarjeta'})[cli.pay]} · pago simulado</p></div>
+      <div><div class="spinner"></div><b style="font-size:20px">${cli.pay === 'tarjeta' ? 'Separando el monto en tu tarjeta…' : 'Cobrando con Yape…'}</b><p class="muted small" style="margin-top:6px">Pago simulado · demo</p></div>
     </div>`;
   } else if (cli.screen === 'carrito') body = viewCarrito();
   else if (cli.screen === 'pedidos') body = viewMisPedidos(myOrders);
@@ -668,7 +745,8 @@ function viewCliente(){
     ${deliveredOrder ? `<div class="overlay done ${cli.deliveredAnim ? 'anim' : ''}">
       <div class="em">🥂</div>
       <h2>¡Entregado!</h2>
-      <p>Pedido #${deliveredOrder.num} · ${esc(deliveredOrder.lines.map(lineText).join(' · '))}<br>¡Salud! Vuelve a la pista.</p>
+      <p>Pedido #${deliveredOrder.num} · ${esc(deliveredOrder.lines.map(lineText).join(' · '))}<br>
+      ${deliveredOrder.pay === 'tarjeta' ? `Se cobró ${money(grand(deliveredOrder))} a tu ${esc(deliveredOrder.card.brand)} •••• ${deliveredOrder.card.last4}.<br>` : ''}¡Salud! Vuelve a la pista.</p>
       <button class="btn ok" data-act="closeDelivered" style="min-width:200px">Listo</button>
     </div>` : ''}
   </div>`;
@@ -700,9 +778,41 @@ function viewCarta(){
 function viewCarrito(){
   const lines = cartLines();
   if (!lines.length) return `<div class="vbody"><div class="empty"><div class="big">🛒</div>Tu pedido está vacío.<br><br><button class="btn pri" data-act="screen" data-s="carta">Ver la carta</button></div></div>`;
-  const pays = [['yape','💜','Yape'],['plin','💙','Plin'],['tarjeta','💳','Tarjeta']];
-  const sub = sumItems(lines), total = sub + COMISION;
+  const pays = [['yape','💜','Yape'],['tarjeta','💳','Tarjeta']];
+  const sub = sumItems(lines), fee = feeFor(lines), total = sub + fee;
   const paused = state.settings.paused;
+  const saved = getCard();
+  let payForm;
+  if (cli.pay === 'yape') {
+    payForm = `<div class="card" style="margin-top:12px">
+      <label class="field" style="margin-top:0"><span>Tu número de Yape</span>
+        <input data-key="yapeCel" value="${esc(cli.yapeCel)}" inputmode="numeric" placeholder="9XX XXX XXX" autocomplete="tel"></label>
+      <label class="field"><span>Código de aprobación (6 números)</span>
+        <input data-key="yapeCode" value="${esc(cli.yapeCode)}" inputmode="numeric" placeholder="123456" autocomplete="one-time-code"></label>
+      <p class="muted small">¿Dónde está? Abre tu app de <b>Yape</b> → menú → <b>"Código de aprobación"</b>. Vence en 2 minutos.</p>
+    </div>`;
+  } else if (saved && !cli.newCard) {
+    payForm = `<div class="card row" style="margin-top:12px">
+      <div><b>💳 ${esc(saved.brand)} •••• ${esc(saved.last4)}</b><div class="muted small">Tarjeta guardada</div></div>
+      <div style="text-align:right"><button class="link" data-act="newCard">Usar otra</button><br><button class="link" data-act="forgetCard">Borrar</button></div>
+    </div>`;
+  } else {
+    payForm = `<div class="card" style="margin-top:12px">
+      <label class="field" style="margin-top:0"><span>Número de tarjeta</span>
+        <input data-key="cardNum" value="${esc(cli.cardNum)}" inputmode="numeric" placeholder="0000 0000 0000 0000" autocomplete="cc-number"></label>
+      <div style="display:flex;gap:10px">
+        <label class="field" style="flex:1;margin:0"><span>Vence (MM/AA)</span><input data-key="cardExp" value="${esc(cli.cardExp)}" inputmode="numeric" placeholder="MM/AA" autocomplete="cc-exp"></label>
+        <label class="field" style="flex:1;margin:0"><span>CVV</span><input data-key="cardCvv" value="${esc(cli.cardCvv)}" inputmode="numeric" placeholder="123" autocomplete="cc-csc"></label>
+      </div>
+      <button class="row" data-act="toggleSave" style="margin-top:14px;justify-content:flex-start;gap:10px;font-weight:700;font-size:14px">
+        <span style="width:22px;height:22px;border-radius:7px;display:grid;place-items:center;background:${cli.cardSave ? 'var(--ac)' : 'var(--s2)'}">${cli.cardSave ? '✓' : ''}</span>
+        Guardar tarjeta para la próxima</button>
+      <p class="muted small" style="margin-top:10px">⚠️ Demo: no pongas una tarjeta real. Usa <b>4242 4242 4242 4242</b>, cualquier fecha futura y cualquier CVV.</p>
+    </div>`;
+  }
+  const how = cli.pay === 'tarjeta'
+    ? `🔒 <b>Solo separamos ${money(total)} en tu tarjeta.</b> Se cobra recién cuando escanean tu QR y te entregan tu trago. Si cancelas antes de que lo preparen o la barra no puede hacerlo, se libera sin cobrarte.<br>Si no lo recoges en ${NO_RECOGIDO_MIN} min, se cobra igual porque ya está preparado.`
+    : `🔒 <b>Se cobra ahora con Yape.</b> Si cancelas antes de que lo preparen o la barra no puede hacerlo, te devolvemos todo.`;
   return `<div class="vbody">
     <button class="btn ghost sm" data-act="screen" data-s="carta">← Seguir pidiendo</button>
     <div class="section-t">Tu pedido</div>
@@ -714,15 +824,18 @@ function viewCarrito(){
     <label class="field"><span>Tu nombre (sale en tu pedido para que no se confundan)</span>
       <input data-key="name" value="${esc(cli.name)}" placeholder="Ej: Chano" maxlength="20" autocomplete="given-name"></label>
     <div class="section-t">¿Cómo pagas?</div>
-    <div class="pays">${pays.map(([k, i, t]) => `<button class="pay ${cli.pay === k ? 'on' : ''}" data-act="pay" data-p="${k}"><i>${i}</i>${t}</button>`).join('')}</div>
+    <div class="pays" style="grid-template-columns:repeat(2,1fr)">${pays.map(([k, i, t]) => `<button class="pay ${cli.pay === k ? 'on' : ''}" data-act="pay" data-p="${k}"><i>${i}</i>${t}</button>`).join('')}</div>
+    ${payForm}
     <div style="margin:20px 0 14px">
       <div class="row small muted"><span>Tragos</span><span>${money(sub)}</span></div>
-      <div class="row small muted" style="margin-top:4px"><span>Servicio Al Toque (sin cola)</span><span>${money(COMISION)}</span></div>
+      <div class="row small muted" style="margin-top:4px"><span>Servicio Al Toque (${money(POR_TRAGO)} × ${countItems(lines)} ${countItems(lines) === 1 ? 'trago' : 'tragos'})</span><span>${money(fee)}</span></div>
       <div class="row" style="margin-top:10px"><span class="muted">Total</span><span class="total">${money(total)}</span></div>
     </div>
     ${paused ? `<div class="banner bad" style="margin:0 0 12px">⏸️ La barra está en pausa. Espera unos minutos.</div>` : ''}
-    <button class="btn pri full" data-act="checkout" ${paused ? 'disabled' : ''} style="font-size:17px;padding:17px">Pagar ${money(total)}</button>
-    <p class="note">Solo se cobra cuando la barra empieza a preparar tu pedido. Si lo cancelas antes, no pagas nada.<br>Demo: el pago es simulado.</p>
+    ${cli.payErr ? `<div class="banner bad payerr" style="margin:0 0 12px">${esc(cli.payErr)}</div>` : ''}
+    <button class="btn pri full" data-act="checkout" ${paused ? 'disabled' : ''} style="font-size:17px;padding:17px">${cli.pay === 'tarjeta' ? 'Separar ' + money(total) : 'Pagar ' + money(total) + ' con Yape'}</button>
+    <p class="note" style="text-align:left">${how}</p>
+    <p class="note">Demo: el pago es simulado, no se cobra nada de verdad.</p>
   </div>`;
 }
 function viewMisPedidos(myOrders){
@@ -735,24 +848,27 @@ function viewMisPedidos(myOrders){
     const cls = o.status === 'listo' ? 'ready' : ended ? 'done' : '';
     let status, extra = '';
     if (o.status === 'nuevo') {
-      status = `💳 Pago reservado. Esperando a la barra · unos <b>${waitMinutes(o)} min</b>`;
-      extra = `<button class="link" data-act="cancelOrder" data-id="${o.id}">Cancelar pedido (no se te cobra)</button>`;
-    } else if (o.status === 'preparando') status = `🍸 Lo están preparando · unos <b>${waitMinutes(o)} min</b>`;
+      status = `⏳ En cola, esperando a la barra · unos <b>${waitMinutes(o)} min</b>`;
+      extra = `<button class="link" data-act="cancelOrder" data-id="${o.id}">Cancelar pedido (${o.pay === 'tarjeta' ? 'se libera lo separado' : 'te devolvemos todo'})</button>`;
+    } else if (o.status === 'preparando') {
+      status = `🍸 Lo están preparando · unos <b>${waitMinutes(o)} min</b>`;
+      extra = `<p class="muted small" style="margin-top:6px">Ya no se puede cancelar: el trago se está preparando.</p>`;
+    }
     else if (o.status === 'listo') {
-      status = `🎉 ¡Listo! Muestra tu QR en ${LOCAL.barra}`;
+      status = `🎉 ¡Listo! Muestra tu QR en ${LOCAL.barra}` + (o.payState === 'separado' ? `<div class="muted small" style="margin-top:4px;font-weight:600">Se cobra a tu tarjeta cuando lo escaneen.</div>` : '');
       extra = `<div style="margin-top:14px;text-align:center"><div class="qrbox sm" data-act="showQr" data-id="${o.id}" style="cursor:pointer">${qrSvg(qrText(o))}</div>
         <button class="btn ok full" data-act="showQr" data-id="${o.id}" style="margin-top:12px">Mostrar QR en grande</button></div>`;
     }
     else if (o.status === 'entregado') status = '¡Entregado! Salud 🥂';
-    else if (o.status === 'cancelado') status = 'Cancelado. No se te cobró nada.';
-    else status = 'La barra no pudo prepararlo. No se te cobró nada.';
-    const payTag = isCharged(o) ? `<span class="pill ok">Cobrado</span>` : o.status === 'nuevo' ? `<span class="pill">Reservado</span>` : `<span class="pill">Sin cobro</span>`;
+    else if (o.status === 'cancelado') status = o.payState === 'liberado' ? 'Cancelado. Se liberó lo separado: no se te cobró nada.' : 'Cancelado. Te devolvemos todo a tu Yape.';
+    else status = 'La barra no pudo prepararlo. ' + (o.payState === 'liberado' ? 'No se te cobró nada.' : 'Te devolvemos todo a tu Yape.');
+    const payTag = `<span class="pill ${o.payState === 'cobrado' ? 'ok' : ''}">${o.pay === 'tarjeta' ? '💳' : '💜'} ${payLabel(o)}</span>`;
     return `<div class="order ${cls}">
       <div class="row"><div><div class="muted small">Pedido</div><div class="num">#${o.num}</div></div><div>${payTag}</div></div>
       ${!ended ? `<div class="track"><div class="on"></div><div class="${step >= 2 ? 'on' : ''}"></div><div class="${step >= 3 ? 'on' : ''}"></div></div>
-      <div class="track-l"><span class="on">Pagado</span><span class="${step >= 2 ? 'on' : ''}">Preparando</span><span class="${step >= 3 ? 'on' : ''}">Listo</span></div>` : ''}
+      <div class="track-l"><span class="on">Pedido</span><span class="${step >= 2 ? 'on' : ''}">Preparando</span><span class="${step >= 3 ? 'on' : ''}">Listo</span></div>` : ''}
       <div class="status">${status}</div>
-      <div class="lines">${o.lines.map(lineText).map(esc).join(' · ')} — ${money(o.total + COMISION)}</div>
+      <div class="lines">${o.lines.map(lineText).map(esc).join(' · ')} — ${money(grand(o))}${o.card ? ` · ${esc(o.card.brand)} •••• ${esc(o.card.last4)}` : ' · Yape'}</div>
       ${extra}
     </div>`;
   }).join('')}
@@ -776,10 +892,11 @@ function viewBarra(){
   const by = s => state.orders.filter(o => o.status === s).sort((a, b) => a.t.created - b.t.created);
   const nuevos = by('nuevo'), prep = by('preparando'), listos = by('listo');
   const ticket = (o, kind) => `<div class="tk ${kind}">
-    <div class="top"><b>#${o.num} · ${esc(o.name)}</b><span class="muted small">${ago(o.t.created)}</span></div>
+    <div class="top"><b>#${o.num} · ${esc(o.name)}</b><span class="muted small">${o.pay === 'tarjeta' ? '💳' : '💜'} ${ago(o.t.created)}</span></div>
     <ul>${o.lines.map(l => `<li><i>${l.qty}×</i>${esc(l.name)}</li>`).join('')}</ul>
-    ${kind === '' ? `<div class="two"><button class="btn yel" data-act="start" data-id="${o.id}">Empezar (se cobra)</button><button class="btn ghost sm" data-act="reject" data-id="${o.id}" title="Por ejemplo, si se acabó algo">No se puede</button></div>` : ''}
+    ${kind === '' ? `<div class="two"><button class="btn yel" data-act="start" data-id="${o.id}">Empezar a preparar</button><button class="btn ghost sm" data-act="reject" data-id="${o.id}" title="Por ejemplo, si se acabó algo">No se puede</button></div>` : ''}
     ${kind === 'prep' ? `<button class="btn ok full" data-act="ready" data-id="${o.id}">¡Listo! Avisar al cliente</button>` : ''}
+    ${kind === '' ? `<p class="muted small" style="margin-top:8px">Al empezar, el cliente ya no puede cancelar.</p>` : ''}
     ${kind === 'lst' ? `<div class="row"><span class="muted small">Esperando que ${esc(o.name)} muestre su QR</span><button class="link" data-act="deliverManual" data-id="${o.id}">Entregar sin QR</button></div>` : ''}
   </div>`;
   const col = (title, list, kind, emptyMsg, top = '') => `<div>
@@ -804,16 +921,18 @@ function viewBarra(){
 
 /* ---------- Dueño ---------- */
 function viewDueno(){
-  const charged = state.orders.filter(isCharged);
-  const ventas = charged.reduce((a, o) => a + o.total, 0);
-  const ticketProm = charged.length ? ventas / charged.length : 0;
-  const withReady = charged.filter(o => o.t.ready);
+  const made = state.orders.filter(isMade);
+  const ventas = made.reduce((a, o) => a + o.total, 0);
+  const cobrado = made.filter(o => o.payState === 'cobrado').reduce((a, o) => a + o.total, 0);
+  const porCobrar = ventas - cobrado;
+  const ticketProm = made.length ? ventas / made.length : 0;
+  const withReady = made.filter(o => o.t.ready);
   const espera = withReady.length ? withReady.reduce((a, o) => a + (o.t.ready - o.t.created), 0) / withReady.length / 60000 : null;
-  const tragos = charged.reduce((a, o) => a + countItems(o.lines), 0);
+  const tragos = made.reduce((a, o) => a + countItems(o.lines), 0);
   const anulados = state.orders.filter(o => o.status === 'cancelado' || o.status === 'rechazado').length;
 
   const count = {};
-  charged.forEach(o => o.lines.forEach(l => count[l.name] = (count[l.name] || 0) + l.qty));
+  made.forEach(o => o.lines.forEach(l => count[l.name] = (count[l.name] || 0) + l.qty));
   const top = Object.entries(count).sort((a, b) => b[1] - a[1]).slice(0, 5);
   const max = top.length ? top[0][1] : 1;
 
@@ -822,14 +941,14 @@ function viewDueno(){
     ${satBox(true)}
     <div class="vbody">
       <div class="kpis">
-        <div class="kpi hl"><div class="muted small">Ventas por la app</div><div class="v">${money(ventas)}</div></div>
-        <div class="kpi"><div class="muted small">Pedidos cobrados</div><div class="v">${charged.length}</div></div>
-        <div class="kpi"><div class="muted small">Tragos vendidos</div><div class="v">${tragos}</div></div>
+        <div class="kpi hl"><div class="muted small">Ventas por la app</div><div class="v">${money(ventas)}</div><div class="muted small">${tragos} ${tragos === 1 ? 'trago' : 'tragos'} · ${made.length} pedidos</div></div>
+        <div class="kpi"><div class="muted small">Ya cobrado</div><div class="v">${money(cobrado)}</div><div class="muted small">Yape + tarjetas entregadas</div></div>
+        <div class="kpi"><div class="muted small">Por cobrar</div><div class="v">${money(porCobrar)}</div><div class="muted small">Tarjetas: se cobra al entregar</div></div>
         <div class="kpi"><div class="muted small">Ticket promedio</div><div class="v">${money(ticketProm)}</div></div>
         <div class="kpi"><div class="muted small">Espera promedio</div><div class="v">${espera === null ? '—' : espera < 1 ? '< 1 min' : espera.toFixed(1) + ' min'}</div></div>
-        <div class="kpi"><div class="muted small">Cancelados / rechazados</div><div class="v">${anulados}</div><div class="muted small">sin cobro</div></div>
+        <div class="kpi"><div class="muted small">Cancelados / rechazados</div><div class="v">${anulados}</div><div class="muted small">devueltos o liberados</div></div>
       </div>
-      <p class="note" style="text-align:left">A ti no te cuesta nada: el cliente paga ${money(COMISION)} de servicio por pedido.</p>
+      <p class="note" style="text-align:left">A ti no te cuesta nada: el cliente paga ${money(POR_TRAGO)} de servicio por cada trago. Las tarjetas que no se recogen en ${NO_RECOGIDO_MIN} min se cobran igual.</p>
 
       <div class="section-t">Capacidad de la barra</div>
       <div class="card row">
@@ -899,7 +1018,8 @@ function render(){
   }
 }
 // Actualiza los "hace X min" y los tiempos de espera
-setInterval(() => { const a = document.activeElement; if (!a || !a.dataset || !a.dataset.key) render(); }, 20000);
+setInterval(() => { chargeUncollected(); const a = document.activeElement; if (!a || !a.dataset || !a.dataset.key) render(); }, 20000);
+chargeUncollected();
 render();
 </script>
 </body>
