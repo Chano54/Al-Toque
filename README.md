@@ -2,7 +2,7 @@
 
 Pide tu trago en la discoteca desde el celular, sin hacer cola. El cliente escanea un QR, pide y paga; la barra recibe el pedido; cuando está listo, el celular del cliente vibra y le muestra un QR que el bartender escanea para entregar.
 
-**Demo en vivo:** https://chano54.github.io/al-toque/
+**Demo en vivo:** https://chano54.github.io/Al-Toque/
 
 ## Qué tiene la demo
 - **Cliente:** carta, tiempo de espera según qué tan llena está la barra, pago reservado (simulado) que solo se cobra cuando la barra empieza a preparar, cancelar sin cobro y aviso con QR.
